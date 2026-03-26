@@ -1,0 +1,100 @@
+name: "Juice Shop CI/CD & Security"
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  # 1. AŞAMA: KOD GÜVENLİĞİ (SAST & Secrets)
+  security-sast:
+    name: "SAST & Secret Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks (Secret Scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          format: sarif
+          report_path: gitleaks.sarif
+        continue-on-error: true
+
+      - name: Semgrep (Code Scan)
+        run: |
+          pip install semgrep
+          semgrep scan --config auto --sarif --output semgrep.sarif
+        continue-on-error: true
+
+      - name: Upload Gitleaks to Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload Semgrep to Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # 2. AŞAMA: BUILD & PUSH (Sadece Güvenlik Taraması Biterse Başlar)
+  build-and-push:
+    name: "Docker Build & GHCR Push"
+    needs: security-sast # Önce güvenlik taraması bitmeli
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Küçük harf zorunluluğu için repo ismini kullanıyoruz
+          tags: ghcr.io/${{ github.repository_owner }}/juice-shop:latest
+
+  # 3. AŞAMA: KONTEYNER GÜVENLİĞİ (İmaj Taraması)
+  security-sca:
+    name: "Container Scan (SCA)"
+    needs: build-and-push # İmaj build edildikten sonra çalışır
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan Image with Grype
+        uses: anchore/scan-action@v3
+        id: scan
+        with:
+          image: "ghcr.io/${{ github.repository_owner }}/juice-shop:latest"
+          fail-build: false
+          output-format: sarif
+
+      - name: Upload Grype to Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: grype
